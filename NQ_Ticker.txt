@@ -1,0 +1,747 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Diagnostics;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using SharpDX;
+using SharpDX.Direct2D1;
+using SharpDX.DirectWrite;
+#endregion
+
+// NQ_Ticker v5.1 – hardcoded earnings calendar, flash fix, pre/post market
+// • v8/finance/chart per symbol – no crumb, always live incl. pre/post
+// • Stopwatch dt – actual elapsed time, speed is real px/sec
+// • Messages rotate every full scroll loop – scroll NEVER resets on data refresh
+// INSTALL: ...\NinjaTrader 8\bin\Custom\Indicators\NQ_Ticker.cs
+// COMPILE: NinjaScript Editor → right-click → Compile (F5)
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    internal class TT  // ticker token
+    {
+        public string Text;
+        public Color4 Col;
+        public float  W;          // measured px width
+        public string FlashSym;   // non-null → check flash dict at render time
+        public Color4 FlashCol;   // color to use when flashing (overrides Col)
+    }
+
+    public class NQ_Ticker : Indicator
+    {
+        // ── Symbols ───────────────────────────────────────────────────────────
+        private static readonly string[] SYMS =
+        {
+            "NVDA","AAPL","MSFT","AMZN","GOOGL","META","TSLA",
+            "AVGO","AMD","ADBE","COST","NFLX","QCOM","INTC","MU"
+        };
+
+        // ── Palette ───────────────────────────────────────────────────────────
+        private static readonly Color4 C_BG    = new Color4(0.05f, 0.05f, 0.12f, 0.97f);
+        private static readonly Color4 C_LINE  = new Color4(0.22f, 0.48f, 0.95f, 1.00f);
+        private static readonly Color4 C_GREEN = new Color4(0.10f, 0.88f, 0.38f, 1.00f);
+        private static readonly Color4 C_RED   = new Color4(1.00f, 0.22f, 0.22f, 1.00f);
+        private static readonly Color4 C_DIM   = new Color4(0.62f, 0.62f, 0.62f, 1.00f);
+        private static readonly Color4 C_YEL   = new Color4(1.00f, 0.87f, 0.12f, 1.00f);
+        private static readonly Color4 C_MSG   = new Color4(0.98f, 0.60f, 0.10f, 1.00f);
+        private static readonly Color4 C_WHITE = new Color4(1.00f, 1.00f, 1.00f, 1.00f);
+        private static readonly Color4 C_EARN  = new Color4(0.85f, 0.20f, 0.95f, 1.00f); // magenta for earnings
+
+        // ── Token list (UI thread only) ───────────────────────────────────────
+        // _toks is what renders. Rebuilt when new stock data or msg advances.
+        private List<TT>  _toks     = new List<TT> { new TT { Text = "   Loading NQ components...   ", Col = C_DIM, W = 0f } };
+        private float     _totalW   = 0f;    // sum of _toks[i].W, 0 means unmeasured
+        private bool      _needsMeasure = true;
+
+        // Pending stock tokens from bg thread (swapped in on UI thread)
+        private List<TT>  _stockPending = null;
+        private readonly object _slock = new object();
+
+        // ── Scroll ────────────────────────────────────────────────────────────
+        private float     _scrollX  = 0f;
+        private readonly Stopwatch _sw = new Stopwatch();
+        private long      _prevMs   = 0;
+
+        // ── Messages ─────────────────────────────────────────────────────────
+        private List<TT>  _stockToks = new List<TT>(); // latest stock tokens
+        private int       _msgIdx   = 0;
+
+        // ── Flash (evaluated at render time, not fetch time) ──────────────────
+        private readonly Dictionary<string, DateTime> _flashAt = new Dictionary<string, DateTime>();
+        private readonly Dictionary<string, double>   _prevPct = new Dictionary<string, double>();
+
+        // ── Earnings: sym → next earnings UTC DateTime ────────────────────────
+        private readonly Dictionary<string, DateTime> _earnings = new Dictionary<string, DateTime>();
+        private readonly object _elock = new object();  // lock for _earnings writes
+
+        // ── Timers / fetch ────────────────────────────────────────────────────
+        private System.Windows.Threading.DispatcherTimer _animTimer;
+        private System.Windows.Threading.DispatcherTimer _fetchTimer;
+        private int _busy = 0;
+
+        // ── DWrite resource ───────────────────────────────────────────────────
+        private TextFormat _fmt;
+
+        // ═════════════════════════════════════════════════════════════════════
+        #region Properties
+
+        [NinjaScriptProperty][Range(20,60)]
+        [Display(Name="Bar Height (px)", GroupName="NQ Ticker", Order=0)]
+        public int BarH { get; set; }
+
+        [NinjaScriptProperty][Range(20,500)]
+        [Display(Name="Scroll Speed (px/s)", GroupName="NQ Ticker", Order=1)]
+        public int Speed { get; set; }
+
+        [NinjaScriptProperty][Range(9,20)]
+        [Display(Name="Font Size", GroupName="NQ Ticker", Order=2)]
+        public int FSize { get; set; }
+
+        [NinjaScriptProperty][Range(30,3600)]
+        [Display(Name="Refresh Every (secs)", GroupName="NQ Ticker", Order=3)]
+        public int RefreshSecs { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Show Econ Events", GroupName="NQ Ticker", Order=4)]
+        public bool ShowEvents { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Message 1",  GroupName="Messages (one per loop)", Order=0)]
+        public string Msg1  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 2",  GroupName="Messages (one per loop)", Order=1)]
+        public string Msg2  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 3",  GroupName="Messages (one per loop)", Order=2)]
+        public string Msg3  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 4",  GroupName="Messages (one per loop)", Order=3)]
+        public string Msg4  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 5",  GroupName="Messages (one per loop)", Order=4)]
+        public string Msg5  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 6",  GroupName="Messages (one per loop)", Order=5)]
+        public string Msg6  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 7",  GroupName="Messages (one per loop)", Order=6)]
+        public string Msg7  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 8",  GroupName="Messages (one per loop)", Order=7)]
+        public string Msg8  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 9",  GroupName="Messages (one per loop)", Order=8)]
+        public string Msg9  { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Message 10", GroupName="Messages (one per loop)", Order=9)]
+        public string Msg10 { get; set; }
+
+        #endregion
+
+        // ═════════════════════════════════════════════════════════════════════
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name               = "NQ_Ticker";
+                Description        = "NQ scrolling ticker – v5";
+                Calculate          = Calculate.OnBarClose;
+                IsOverlay          = true;
+                DrawOnPricePanel   = true;
+                IsChartOnly        = true;
+                DisplayInDataBox   = false;
+                PaintPriceMarkers  = false;
+                ScaleJustification = NinjaTrader.Gui.Chart.ScaleJustification.Right;
+
+                BarH        = 26;
+                Speed       = 80;
+                FSize       = 11;
+                RefreshSecs = 60;
+                ShowEvents  = true;
+
+                Msg1=""; Msg2=""; Msg3=""; Msg4=""; Msg5="";
+                Msg6=""; Msg7=""; Msg8=""; Msg9=""; Msg10="";
+            }
+            else if (State == State.DataLoaded)
+            {
+                Task.Run((Action)DoFetch);
+
+                ChartControl?.Dispatcher.InvokeAsync(() =>
+                {
+                    _sw.Start();
+                    _prevMs = 0;
+
+                    _animTimer = new System.Windows.Threading.DispatcherTimer
+                        { Interval = TimeSpan.FromMilliseconds(22) };
+                    _animTimer.Tick += OnAnim;
+                    _animTimer.Start();
+
+                    _fetchTimer = new System.Windows.Threading.DispatcherTimer
+                        { Interval = TimeSpan.FromSeconds(RefreshSecs) };
+                    _fetchTimer.Tick += (s, e) => Task.Run((Action)DoFetch);
+                    _fetchTimer.Start();
+                });
+            }
+            else if (State == State.Terminated)
+            {
+                _animTimer?.Stop();
+                _fetchTimer?.Stop();
+                _fmt?.Dispose(); _fmt = null;
+            }
+        }
+
+        // ── 45fps tick ────────────────────────────────────────────────────────
+        private void OnAnim(object sender, EventArgs e)
+        {
+            // 1. Swap in new stock tokens if ready (NO scroll reset)
+            List<TT> newStock = null;
+            lock (_slock) { newStock = _stockPending; _stockPending = null; }
+            if (newStock != null)
+            {
+                _stockToks     = newStock;
+                RebuildToks();   // keep current _msgIdx, keep _scrollX
+            }
+
+            // 2. Real elapsed dt — capped to avoid jump after tab switch etc
+            long nowMs = _sw.ElapsedMilliseconds;
+            float dt   = Math.Min((nowMs - _prevMs) / 1000f, 0.05f);
+            _prevMs    = nowMs;
+
+            // 3. Advance scroll (only if measured)
+            if (_totalW > 1f)
+            {
+                _scrollX -= Speed * dt;
+
+                // Full loop complete → advance message
+                if (_scrollX < -_totalW)
+                {
+                    _scrollX += _totalW;   // seamless wrap
+                    NextMsg();             // changes _toks, remeasures next render
+                }
+            }
+
+            ChartControl?.InvalidateVisual();
+        }
+
+        // ── Rebuild _toks = stockToks + current message ───────────────────────
+        // Does NOT touch _scrollX. Does NOT touch _totalW (marked unmeasured).
+        private void RebuildToks()
+        {
+            var list = new List<TT>(_stockToks);
+
+            string[] msgs = AllMsgs();
+            if (msgs.Length > 0)
+            {
+                string msg = msgs[_msgIdx % msgs.Length];
+                list.Add(new TT { Text = "   \u25BA ", Col = C_MSG });
+                list.Add(new TT { Text = msg.Trim(),   Col = C_MSG });
+                list.Add(new TT { Text = "   \u2502",  Col = C_LINE });
+            }
+
+            _toks         = list;
+            _needsMeasure = true;   // measure on next OnRender
+            // _totalW kept — wrap math stays valid until OnRender remeasures
+        }
+
+        private void NextMsg()
+        {
+            string[] msgs = AllMsgs();
+            if (msgs.Length > 0)
+                _msgIdx = (_msgIdx + 1) % msgs.Length;
+            RebuildToks();
+        }
+
+        private string[] AllMsgs()
+        {
+            var r = new List<string>();
+            foreach (var m in new[] { Msg1,Msg2,Msg3,Msg4,Msg5,Msg6,Msg7,Msg8,Msg9,Msg10 })
+                if (!string.IsNullOrWhiteSpace(m)) r.Add(m);
+            return r.ToArray();
+        }
+
+        protected override void OnBarUpdate() { }
+
+        // ═════════════════════════════════════════════════════════════════════
+        protected override void OnRender(ChartControl cc, ChartScale cs)
+        {
+            if (RenderTarget == null) return;
+
+            if (_fmt == null)
+                _fmt = new TextFormat(Core.Globals.DirectWriteFactory,
+                    "Consolas", FontWeight.Normal, FontStyle.Normal, FontStretch.Normal, FSize)
+                { TextAlignment = TextAlignment.Leading, ParagraphAlignment = ParagraphAlignment.Center };
+
+            // Panel bounds
+            float px = (float)ChartPanel.X;
+            float py = (float)ChartPanel.Y;
+            float pw = (float)ChartPanel.W;
+            float ph = (float)ChartPanel.H;
+            float bH = BarH;
+            float bY = py + ph - bH;
+
+            // Background
+            using (var b = new SolidColorBrush(RenderTarget, C_BG))
+                RenderTarget.FillRectangle(new RectangleF(px, bY, pw, bH), b);
+
+            // Top line
+            using (var b = new SolidColorBrush(RenderTarget, C_LINE))
+                RenderTarget.DrawLine(new Vector2(px, bY), new Vector2(px + pw, bY), b, 2f);
+
+            // NQ badge
+            const float BDG = 40f;
+            using (var b = new SolidColorBrush(RenderTarget, C_LINE))
+                RenderTarget.FillRectangle(new RectangleF(px, bY, BDG, bH), b);
+            using (var b  = new SolidColorBrush(RenderTarget, C_WHITE))
+            using (var tl = new TextLayout(Core.Globals.DirectWriteFactory, "NQ", _fmt, BDG, bH))
+            {
+                tl.TextAlignment = TextAlignment.Center; tl.ParagraphAlignment = ParagraphAlignment.Center;
+                RenderTarget.DrawTextLayout(new Vector2(px, bY), tl, b);
+            }
+
+            // (clock removed)
+            const float TSW = 0f;
+
+            // Measure tokens once after rebuild
+            if (_needsMeasure && _toks.Count > 0)
+            {
+                float sum = 0f;
+                foreach (var t in _toks)
+                {
+                    if (t.W < 1f)   // only measure if not already measured
+                    {
+                        using (var tl = new TextLayout(Core.Globals.DirectWriteFactory, t.Text, _fmt, 9999f, bH))
+                            t.W = tl.Metrics.Width + 1f;
+                    }
+                    sum += t.W;
+                }
+                _totalW       = sum;
+                _needsMeasure = false;
+                // NO scroll reset here — scroll continues seamlessly
+            }
+
+            // Clip and draw scroll
+            float clipX = px + BDG;
+            float clipW = pw - BDG - TSW - 6f;
+            RenderTarget.PushAxisAlignedClip(new RectangleF(clipX, bY, clipW, bH), AntialiasMode.Aliased);
+
+            if (_totalW > 1f)
+            {
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    float x = clipX + _scrollX + pass * _totalW;
+                    if (x > clipX + clipW || x + _totalW < clipX) continue;
+
+                    foreach (var t in _toks)
+                    {
+                        if (x + t.W > clipX && x < clipX + clipW)
+                        {
+                            // Evaluate flash at render time (not baked at fetch time)
+                            bool isFlashing = false;
+                            if (t.FlashSym != null)
+                            {
+                                DateTime fa2;
+                                if (_flashAt.TryGetValue(t.FlashSym, out fa2))
+                                    isFlashing = (DateTime.UtcNow - fa2).TotalSeconds < 1.5;
+                            }
+
+                            Color4 drawCol = isFlashing ? t.FlashCol : t.Col;
+
+                            // Draw a bright background behind flashing tokens
+                            if (isFlashing)
+                            {
+                                Color4 bgFlash = drawCol.ToVector4().W > 0
+                                    ? new Color4(drawCol.Red * 0.15f,
+                                                 drawCol.Green * 0.15f,
+                                                 drawCol.Blue * 0.15f, 0.85f)
+                                    : new Color4(0.15f, 0.15f, 0.15f, 0.85f);
+                                using (var bf = new SolidColorBrush(RenderTarget, bgFlash))
+                                    RenderTarget.FillRectangle(new RectangleF(x, bY + 2f, t.W, bH - 4f), bf);
+                            }
+
+                            using (var b  = new SolidColorBrush(RenderTarget, drawCol))
+                            using (var tl = new TextLayout(Core.Globals.DirectWriteFactory, t.Text, _fmt, t.W + 2f, bH))
+                            {
+                                tl.ParagraphAlignment = ParagraphAlignment.Center;
+                                RenderTarget.DrawTextLayout(new Vector2(x, bY), tl, b);
+                            }
+                        }
+                        x += t.W;
+                    }
+                }
+            }
+
+            RenderTarget.PopAxisAlignedClip();
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
+        //  DATA FETCH
+        // ═════════════════════════════════════════════════════════════════════
+
+        private void DoFetch()
+        {
+            if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0) return;
+            var list = new List<TT>();
+            try
+            {
+                list.Add(new TT { Text = "   ", Col = C_DIM });
+                FetchStocks(list);
+                AppendEarningsToks(list);  // hardcoded calendar, zero HTTP
+                if (ShowEvents) FetchCalendar(list);
+                list.Add(new TT { Text = "     ", Col = C_DIM });
+            }
+            catch (Exception ex) { Log("DoFetch: " + ex.Message); }
+            finally
+            {
+                lock (_slock) _stockPending = list;
+                Interlocked.Exchange(ref _busy, 0);
+            }
+        }
+
+        // ── v8/finance/chart – no crumb, no cookies, always live ─────────────
+        private void FetchStocks(List<TT> list)
+        {
+            try
+            {
+                TimeZoneInfo etz;
+                try   { etz = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+                catch { etz = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); }
+
+                var   etNow   = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, etz);
+                var   etTime  = etNow.TimeOfDay;
+                bool  preHrs  = etTime < new TimeSpan(9, 30, 0);
+                bool  postHrs = etTime >= new TimeSpan(16, 0, 0);
+
+                string bust = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+
+                var res     = new Tuple<string,double,double,string>[SYMS.Length];
+                Parallel.For(0, SYMS.Length, new ParallelOptions { MaxDegreeOfParallelism = 6 }, i =>
+                {
+                    try
+                    {
+                        string url  = "https://query1.finance.yahoo.com/v8/finance/chart/"
+                                    + SYMS[i] + "?range=1d&interval=1m&includePrePost=true&_=" + bust;
+                        string json = Get(url);
+                        if (string.IsNullOrEmpty(json)) return;
+
+                        // Parse meta block
+                        int mi = json.IndexOf("\"meta\":{", StringComparison.Ordinal);
+                        if (mi < 0) return;
+                        int mb = json.IndexOf('{', mi);
+                        int me = ObjEnd(json, mb);
+                        string meta = json.Substring(mb, me - mb + 1);
+
+                        double regPx  = Jd(meta, "regularMarketPrice");
+                        double prev   = Jd(meta, "chartPreviousClose");
+                        double prePx  = Jd(meta, "preMarketPrice");
+                        double postPx = Jd(meta, "postMarketPrice");
+                        if (prev <= 0) return;
+
+                        double px; double pct; string lbl;
+                        if      (preHrs  && prePx  > 0) { px = prePx;  pct = (prePx  - prev)/prev*100; lbl = "pre"; }
+                        else if (postHrs && postPx > 0) { px = postPx; pct = (postPx - prev)/prev*100; lbl = "aft"; }
+                        else                             { px = regPx;  pct = (regPx  - prev)/prev*100; lbl = "";    }
+
+                        res[i] = Tuple.Create(SYMS[i], pct, px, lbl);
+                    }
+                    catch (Exception ex) { Log(SYMS[i] + ": " + ex.Message); }
+                });
+
+                var quotes = new List<Tuple<string,double,double,string>>();
+                foreach (var r in res) if (r != null) quotes.Add(r);
+                if (quotes.Count == 0) { Err(list, "all symbols failed"); return; }
+                quotes.Sort((a,b) => Math.Abs(b.Item2).CompareTo(Math.Abs(a.Item2)));
+
+                var now = DateTime.UtcNow;
+                foreach (var q in quotes)
+                {
+                    string sym = q.Item1; double pct = q.Item2; double px = q.Item3; string lbl = q.Item4;
+
+                    // Register flash if pct changed by threshold
+                    double prev2;
+                    if (_prevPct.TryGetValue(sym, out prev2) && Math.Abs(pct - prev2) >= 0.05)
+                        _flashAt[sym] = now;
+                    _prevPct[sym] = pct;
+
+                    string sgn  = pct >= 0 ? "+" : "";
+                    Color4 cPct = pct >= 0 ? C_GREEN : C_RED;
+                    // Flash color evaluated at RENDER time via FlashSym — not baked here
+                    Color4 cSym = C_DIM;
+                    Color4 cNum = cPct;
+
+                    list.Add(new TT { Text = "  " + sym + (lbl.Length>0?"["+lbl+"]":"") + " ",
+                                      Col = cSym, FlashSym = sym, FlashCol = C_WHITE });
+                    list.Add(new TT { Text = sgn + pct.ToString("F2") + "%",
+                                      Col = cNum, FlashSym = sym, FlashCol = C_WHITE });
+                    if (px > 0) list.Add(new TT { Text = "  $" + px.ToString("F2"),
+                                                  Col = cSym, FlashSym = sym, FlashCol = C_WHITE });
+                    list.Add(new TT { Text = "  \u2502  ", Col = C_LINE });
+                }
+            }
+            catch (Exception ex) { Err(list, Clip(ex.Message,40)); Log("FetchStocks: "+ex.Message); }
+        }
+
+        // ── Hardcoded earnings calendar — updated each quarter ─────────────────
+        // No HTTP calls, no auth, no rate limits. Update dates each quarter.
+        // Format: "SYM", new DateTime(year, month, day) — all After-Close (AMC)
+        private static readonly Tuple<string,DateTime>[] EARN_CAL = new[]
+        {
+            // ── Q1 2026 reports ───────────────────────────────────────────────────
+            Tuple.Create("AVGO",  new DateTime(2026,  3,  4, 20, 0, 0, DateTimeKind.Utc)),  // Mar 4 AMC confirmed
+            Tuple.Create("COST",  new DateTime(2026,  3, 12, 20, 0, 0, DateTimeKind.Utc)),  // Mar 12 AMC est
+            Tuple.Create("ADBE",  new DateTime(2026,  3, 12, 20, 0, 0, DateTimeKind.Utc)),  // Mar 12 AMC confirmed
+            Tuple.Create("MU",    new DateTime(2026,  3, 25, 20, 0, 0, DateTimeKind.Utc)),  // Mar 25 AMC est
+            // ── Q2 2026 reports (April/May) ───────────────────────────────────────
+            Tuple.Create("NFLX",  new DateTime(2026,  4, 15, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("TSLA",  new DateTime(2026,  4, 22, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("META",  new DateTime(2026,  4, 29, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("MSFT",  new DateTime(2026,  4, 29, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("GOOGL", new DateTime(2026,  4, 29, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("AMZN",  new DateTime(2026,  5,  1, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("AAPL",  new DateTime(2026,  5,  1, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("AMD",   new DateTime(2026,  5,  5, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("QCOM",  new DateTime(2026,  5,  6, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("AVGO",  new DateTime(2026,  6, 10, 20, 0, 0, DateTimeKind.Utc)),  // Q2 est
+            Tuple.Create("NVDA",  new DateTime(2026,  5, 27, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("INTC",  new DateTime(2026,  4, 23, 20, 0, 0, DateTimeKind.Utc)),
+            Tuple.Create("ADBE",  new DateTime(2026,  6, 11, 20, 0, 0, DateTimeKind.Utc)),  // Q2 est
+        };
+
+        // ── Append earnings warning tokens (hardcoded calendar, zero HTTP) ────────
+        private void AppendEarningsToks(List<TT> list)
+        {
+            var utcNow = DateTime.UtcNow;
+            var warns  = new List<string>();
+            foreach (var e in EARN_CAL)
+            {
+                double daysAway = (e.Item2 - utcNow).TotalDays;
+                if (daysAway >= -0.5 && daysAway <= 7.0)
+                {
+                    var localDt = e.Item2.ToLocalTime();
+                    string when;
+                    if      (daysAway < 0)   when = "today";
+                    else if (daysAway < 1.0) when = "TODAY "    + localDt.ToString("HH:mm");
+                    else if (daysAway < 2.0) when = "TOMORROW " + localDt.ToString("HH:mm");
+                    else                     when = localDt.ToString("ddd d MMM");
+                    // Avoid duplicates (same sym appearing twice in cal)
+                    string tok = e.Item1 + " earnings " + when;
+                    if (!warns.Contains(tok)) warns.Add(tok);
+                }
+            }
+            if (warns.Count == 0) return;
+            foreach (var w in warns)
+            {
+                list.Add(new TT { Text = w,           Col = C_EARN });
+                list.Add(new TT { Text = "  │  ", Col = C_LINE });
+            }
+        }
+
+                // ── ForexFactory calendar ─────────────────────────────────────────────
+        private void FetchCalendar(List<TT> list)
+        {
+            try
+            {
+                TLS();
+                string json;
+                using (var wc = new WebClient())
+                {
+                    wc.Headers[HttpRequestHeader.UserAgent] = UA;
+                    wc.Headers[HttpRequestHeader.Accept]    = "application/json,*/*";
+                    wc.Headers["Referer"] = "https://www.forexfactory.com/";
+                    wc.Proxy = null; wc.Encoding = Encoding.UTF8;
+                    json = wc.DownloadString("https://nfs.faireconomy.media/ff_calendar_thisweek.json");
+                }
+                string today = DateTime.UtcNow.ToString("yyyy-MM-dd");
+                bool any = false;
+                foreach (var o in Objs(json))
+                {
+                    if (!Js(o,"impact").Equals("High", StringComparison.OrdinalIgnoreCase)) continue;
+                    string ctry = Js(o,"country");
+                    if (!ctry.Equals("USD",StringComparison.OrdinalIgnoreCase) &&
+                        !ctry.Equals("US", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!Js(o,"date").StartsWith(today)) continue;
+                    string t = "--:--";
+                    DateTime dt;
+                    if (DateTime.TryParse(Js(o,"date"), out dt))
+                        t = dt.ToLocalTime().ToString("HH:mm");
+                    string body = "  \u25C6 " + t + " " + Js(o,"title");
+                    string act  = Js(o,"actual");
+                    if (!string.IsNullOrEmpty(act)) body += "  A:"+act+" F:"+Js(o,"forecast");
+                    list.Add(new TT { Text = body,       Col = C_YEL });
+                    list.Add(new TT { Text = "  \u2502  ", Col = C_LINE });
+                    any = true;
+                }
+                if (!any)
+                {
+                    list.Add(new TT { Text = "  \u25C6 No red-folder US events today", Col = C_DIM });
+                    list.Add(new TT { Text = "  \u2502  ", Col = C_LINE });
+                }
+            }
+            catch { list.Add(new TT { Text = "  [Events n/a]", Col = C_DIM }); }
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
+        //  HTTP / JSON / UTIL
+        // ═════════════════════════════════════════════════════════════════════
+
+        private static string Get(string url)
+        {
+            TLS();
+            var r = (HttpWebRequest)WebRequest.Create(url);
+            r.UserAgent = UA;
+            r.Headers["Accept-Language"] = "en-US,en;q=0.9";
+            r.Headers["Cache-Control"]   = "no-cache";
+            r.Headers["Pragma"]          = "no-cache";
+            r.Accept  = "application/json,*/*";
+            r.Timeout = 10000;
+            r.Proxy   = null;
+            using (var rs = (HttpWebResponse)r.GetResponse())
+            using (var sr = new StreamReader(rs.GetResponseStream()))
+                return sr.ReadToEnd();
+        }
+
+        private static void TLS() =>
+            ServicePointManager.SecurityProtocol =
+                SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls;
+
+        private const string UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+        private static void Err(List<TT> l, string m)
+        {
+            l.Add(new TT { Text = "  [" + m + "]  ", Col = C_RED });
+            l.Add(new TT { Text = "  \u2502  ", Col = C_LINE });
+        }
+
+        private static string Clip(string s, int n) =>
+            s != null && s.Length > n ? s.Substring(0, n) : (s ?? "");
+
+        private static List<string> Objs(string s)
+        {
+            var r = new List<string>(); int d = 0, st = -1; bool ins = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\' && ins) { i++; continue; }
+                if (c == '"') { ins = !ins; continue; }
+                if (ins) continue;
+                if (c == '{') { if (d++ == 0) st = i; }
+                else if (c == '}') if (--d == 0 && st >= 0) { r.Add(s.Substring(st, i-st+1)); st = -1; }
+            }
+            return r;
+        }
+
+        private static int ArrEnd(string s, int start)
+        {
+            int d = 0; bool ins = false;
+            for (int i = start; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\' && ins) { i++; continue; }
+                if (c == '"') { ins = !ins; continue; }
+                if (ins) continue;
+                if (c == '[') d++;
+                else if (c == ']') if (--d == 0) return i;
+            }
+            return s.Length - 1;
+        }
+
+                private static int ObjEnd(string s, int start)
+        {
+            int d = 0; bool ins = false;
+            for (int i = start; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\' && ins) { i++; continue; }
+                if (c == '"') { ins = !ins; continue; }
+                if (ins) continue;
+                if (c == '{') d++;
+                else if (c == '}') if (--d == 0) return i;
+            }
+            return s.Length - 1;
+        }
+
+        private static string Js(string o, string k)
+        {
+            var m = Regex.Match(o, "\"" + Regex.Escape(k) +
+                "\"\\s*:\\s*(?:\"((?:[^\"\\\\]|\\\\.)*)\"|([^,}\\]\\s]+))");
+            if (!m.Success) return "";
+            string v = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value.Trim();
+            return v == "null" ? "" : v;
+        }
+
+        private static double Jd(string o, string k)
+        {
+            double d = 0;
+            double.TryParse(Js(o, k), System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out d);
+            return d;
+        }
+
+        private static void Log(string m) =>
+            NinjaTrader.Code.Output.Process("[NQ_Ticker] " + m, PrintTo.OutputTab1);
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+    {
+        private NQ_Ticker[] cacheNQ_Ticker;
+
+        public NQ_Ticker NQ_Ticker(int barH, int speed, int fSize, int refreshSecs, bool showEvents,
+            string msg1,string msg2,string msg3,string msg4,string msg5,
+            string msg6,string msg7,string msg8,string msg9,string msg10)
+        { return NQ_Ticker(Input,barH,speed,fSize,refreshSecs,showEvents,msg1,msg2,msg3,msg4,msg5,msg6,msg7,msg8,msg9,msg10); }
+
+        public NQ_Ticker NQ_Ticker(ISeries<double> input, int barH, int speed, int fSize, int refreshSecs, bool showEvents,
+            string msg1,string msg2,string msg3,string msg4,string msg5,
+            string msg6,string msg7,string msg8,string msg9,string msg10)
+        {
+            if (cacheNQ_Ticker != null)
+                for (int idx = 0; idx < cacheNQ_Ticker.Length; idx++)
+                {
+                    var c = cacheNQ_Ticker[idx];
+                    if (c.BarH==barH && c.Speed==speed && c.RefreshSecs==refreshSecs && c.EqualsInput(input))
+                        return c;
+                }
+            return CacheIndicator<NQ_Ticker>(new NQ_Ticker
+            {
+                BarH=barH,Speed=speed,FSize=fSize,RefreshSecs=refreshSecs,ShowEvents=showEvents,
+                Msg1=msg1,Msg2=msg2,Msg3=msg3,Msg4=msg4,Msg5=msg5,
+                Msg6=msg6,Msg7=msg7,Msg8=msg8,Msg9=msg9,Msg10=msg10
+            }, input, ref cacheNQ_Ticker);
+        }
+    }
+}
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+    public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+    {
+        public Indicators.NQ_Ticker NQ_Ticker(int barH,int speed,int fSize,int refreshSecs,bool showEvents,
+            string msg1,string msg2,string msg3,string msg4,string msg5,
+            string msg6,string msg7,string msg8,string msg9,string msg10)
+        { return indicator.NQ_Ticker(Input,barH,speed,fSize,refreshSecs,showEvents,msg1,msg2,msg3,msg4,msg5,msg6,msg7,msg8,msg9,msg10); }
+    }
+}
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+    {
+        public Indicators.NQ_Ticker NQ_Ticker(int barH,int speed,int fSize,int refreshSecs,bool showEvents,
+            string msg1,string msg2,string msg3,string msg4,string msg5,
+            string msg6,string msg7,string msg8,string msg9,string msg10)
+        { return indicator.NQ_Ticker(Input,barH,speed,fSize,refreshSecs,showEvents,msg1,msg2,msg3,msg4,msg5,msg6,msg7,msg8,msg9,msg10); }
+    }
+}
+#endregion
